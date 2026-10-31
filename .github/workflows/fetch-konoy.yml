@@ -13,44 +13,57 @@ jobs:
   fetch:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GIT_TERMINAL_PROMPT: '0'
     steps:
       - name: Download konoy.zip from Google Drive (public link)
         run: |
-          set -euo pipefail
+          set -euxo pipefail
           pip install -q gdown
           gdown 1K5Egd3z1XONlfiJAjPnoqrH-Gg2YPD_d -O konoy.zip
-          echo "size=$(stat -c%s konoy.zip)"
-          stat -c%s konoy.zip | grep -qx 159324312 && echo "SIZE_OK" || { echo "SIZE_MISMATCH"; exit 1; }
-          sha256sum konoy.zip
+          test "$(stat -c%s konoy.zip)" = "159324312"
+          sha256sum konoy.zip | tee checksum.txt
 
-      - name: Show zip contents (for the log)
+      - name: List zip contents into LISTING.txt
         run: |
-          set -euo pipefail
-          python3 - <<'EOF'
+          set -euxo pipefail
+          python3 - <<'EOF' | tee LISTING.txt
           import zipfile
           with zipfile.ZipFile('konoy.zip') as z:
-              bad = z.testzip()
-              print('CRC:', 'OK' if bad is None else f'BAD -> {bad}')
+              print('CRC:', 'OK' if z.testzip() is None else 'BAD')
               for i in z.infolist():
                   print(f"{i.file_size:>12}  {i.filename}")
           EOF
 
-      - name: Split into <100MB chunks and publish as tag konoy-data
+      - name: Publish progress marker to session branch (via API)
         run: |
-          set -euo pipefail
+          set -euxo pipefail
+          CONTENT=$(printf 'downloaded+listed\n%s\n' "$(cat LISTING.txt)" | base64 -w0)
+          gh api -X PUT "repos/${GITHUB_REPOSITORY}/contents/.ci/konoy-progress.txt" \
+            -f message="ci: konoy progress (listing)" \
+            -f branch="arena/48c0a92d-repo" \
+            -f content="$CONTENT" --jq '.commit.sha'
+
+      - name: Split into <100MB chunks and push tag konoy-data
+        run: |
+          set -euxo pipefail
+          trap 'echo "::error::split/push FAILED at script line ${LINENO} (exit ${?})"' ERR
           git init datarepo
           cd datarepo
           git config user.email "ci@localhost"
           git config user.name "konoy-ci"
           git checkout --orphan konoy-data
+          cp ../LISTING.txt ../checksum.txt .
           split -b 95M ../konoy.zip chunk-
           ls -l chunk-*
           for f in chunk-*; do
             sz=$(stat -c%s "$f")
-            [ "$sz" -lt 104857600 ] || { echo "$f too big"; exit 1; }
+            if [ "$sz" -ge 104857600 ]; then echo "::error::${f} too big (${sz})"; exit 1; fi
           done
-          git add chunk-*
-          git commit -m "konoy.zip split chunks (relay from Google Drive)"
+          git add chunk-* LISTING.txt checksum.txt
+          git commit -m "konoy.zip relay chunks (from Google Drive via Actions)"
           git tag -f konoy-data
-          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git push -f origin refs/tags/konoy-data
+          echo "::notice::konoy-data tag pushed OK"
